@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from datetime import datetime, timedelta
 import logging
 from pathlib import Path
@@ -107,6 +107,7 @@ class CasambiApi:
         self._cancel_bluetooth_callback: Callable[[], None] | None = None
         self._cancel_watchdog: Callable[[], None] | None = None
         self._watchdog_misses = 0
+        self._link_suspect = False
         self._reconnect_lock = asyncio.Lock()
         self._first_disconnect = True
 
@@ -132,6 +133,7 @@ class CasambiApi:
 
             await self.casa.connect(device, self.password)
             self._first_disconnect = True
+            self._link_suspect = False
         except BluetoothError as err:
             raise ConfigEntryNotReady("Failed to use bluetooth") from err
         except NetworkNotFoundError as err:
@@ -277,6 +279,7 @@ class CasambiApi:
 
     @callback
     def _casa_disconnect(self) -> None:
+        self._link_suspect = True
         if self._first_disconnect:
             self._first_disconnect = False
             self.conf_entry.async_create_background_task(
@@ -320,16 +323,21 @@ class CasambiApi:
         finally:
             self._reconnect_lock.release()
 
-    async def ensure_connected(self) -> None:
+    async def ensure_connected(self, force: bool = False) -> None:
         """Make sure a live connection exists before sending a command.
 
-        Entities are never marked unavailable, so a command can arrive while
-        the Casambi session is down. Reconnect on demand instead of failing.
-        This also bypasses the watchdog's visibility check, which is exactly
-        what is needed to break out of a stale-link deadlock: try_reconnect
-        disconnects first, dropping the half-open link.
+        Entities are never marked unavailable, so a command can arrive at any
+        time. Rebuild the connection on demand rather than failing.
+
+        casa.connected being True is not by itself proof of a usable link: the
+        library flag can survive a link that is actually dead, in which case
+        every recovery path keyed off it silently does nothing. So a rebuild
+        also happens when the link is merely suspect (a disconnect was seen,
+        or the previous command failed) or when the caller forces one.
+        try_reconnect disconnects before connecting, so this doubles as the
+        escape from a stale, half-open link.
         """
-        if self.casa.connected:
+        if self.casa.connected and not force and not self._link_suspect:
             return
 
         if self._reconnect_lock.locked():
@@ -339,7 +347,13 @@ class CasambiApi:
             async with self._reconnect_lock:
                 pass
         else:
-            _LOGGER.debug("Command issued while disconnected; connecting on demand.")
+            _LOGGER.debug(
+                "Rebuilding connection before command (forced=%s, suspect=%s, "
+                "library_connected=%s).",
+                force,
+                self._link_suspect,
+                self.casa.connected,
+            )
             await self.try_reconnect()
 
         if not self.casa.connected:
@@ -347,6 +361,26 @@ class CasambiApi:
                 f"Casambi network {self.address} is not connected and an "
                 "on-demand reconnect did not succeed"
             )
+
+    async def execute(self, action: Callable[[], Awaitable[None]]) -> None:
+        """Run a command, reconnecting first if needed and retrying once.
+
+        `action` must be a factory returning a fresh awaitable on each call,
+        because it may be awaited twice.
+        """
+        await self.ensure_connected()
+        try:
+            await action()
+        except Exception:  # pylint: disable=broad-except
+            # The link looked usable but the command did not get through.
+            # Treat it as dead, rebuild it, and give the command one more go.
+            _LOGGER.debug(
+                "Command failed; forcing a reconnect and retrying once.",
+                exc_info=True,
+            )
+            self._link_suspect = True
+            await self.ensure_connected(force=True)
+            await action()
 
     def register_unit_updates(self, unit: Unit, c: Callable[[Unit], None]) -> None:
         """Register a callback for unit updates.
