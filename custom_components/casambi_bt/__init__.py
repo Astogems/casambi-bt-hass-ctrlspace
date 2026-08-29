@@ -142,8 +142,12 @@ class CasambiApi:
             self.casa.registerDisconnectCallback(self._casa_disconnect)
             self.casa.registerUnitChangedHandler(self._unit_changed_handler)
 
-            async with asyncio.timeout(CONNECT_TIMEOUT):
-                await self.casa.connect(device, self.password)
+            try:
+                async with asyncio.timeout(CONNECT_TIMEOUT):
+                    await self.casa.connect(device, self.password)
+            except BaseException:
+                await self._release_failed_connection()
+                raise
             self._first_disconnect = True
             self._link_suspect = False
         except BluetoothError as err:
@@ -261,6 +265,31 @@ class CasambiApi:
         except Exception:  # pylint: disable=broad-except
             _LOGGER.debug(
                 "Watchdog reconnect attempt failed; will retry later.", exc_info=True
+            )
+
+    async def _release_failed_connection(self) -> None:
+        """Release the BLE client left behind by a failed connect.
+
+        establish_connection can bring the GATT link up and then the Casambi
+        key exchange never completes: CasambiClient.exchangeKey waits on an
+        asyncio.Event with no timeout, so a node that connects but never sends
+        the key-exchange notification hangs the connect forever.
+
+        The library only tears the client down in disconnect(), so a connect
+        that fails or times out leaves its BleakClient connected. The node then
+        has an open session it will not re-key, and every later attempt fails
+        the same way. Nothing short of ending the Home Assistant process
+        dropped that link, which is why only a restart used to help - a config
+        entry reload built new objects but the old link was still held.
+        """
+        _LOGGER.debug("Releasing the BLE client left behind by a failed connect.")
+        try:
+            async with asyncio.timeout(DISCONNECT_TIMEOUT):
+                await self.casa.disconnect()
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "Failed to release the connection after a failed connect.",
+                exc_info=True,
             )
 
     async def _force_teardown(self) -> None:
