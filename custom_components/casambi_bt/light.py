@@ -255,20 +255,38 @@ class CasambiLightGroup(CasambiLight, CasambiNetworkGroup):
         for unit in group.units:
             supported_modes = supported_modes.union(self._capabilities_helper(unit))
 
-        # Color temperature for groups isn't supported yet.
-        # Open problems:
-        #  - How do we determine min and max temperature? Is it the union or intersection of the intervals?
-        #    We can't really scale the temperature since we don't have a min or max.
-        #  - How does the SetTemperature opcode work (for casambi-bt)?
+        # Colour temperature is supported for groups: Casambi.setTemperature
+        # takes a Group target and sends the group-addressed SetTemperature
+        # opcode. Use the intersection of the member ranges rather than the
+        # union, so every value Home Assistant offers is reachable by every
+        # unit in the group.
         if ColorMode.COLOR_TEMP in supported_modes:
-            supported_modes.remove(ColorMode.COLOR_TEMP)
+            temp_controls = []
+            for unit in group.units:
+                control = unit.unitType.get_control(UnitControlType.TEMPERATURE)
+                if control is not None and control.min and control.max:
+                    temp_controls.append(control)
+
+            low = max((c.min for c in temp_controls), default=0)
+            high = min((c.max for c in temp_controls), default=0)
+            if temp_controls and low < high:
+                self._attr_min_color_temp_kelvin = low
+                self._attr_max_color_temp_kelvin = high
+            else:
+                # No usable common range, so the mode can't be offered.
+                supported_modes.remove(ColorMode.COLOR_TEMP)
+
+        # Home Assistant rejects BRIGHTNESS or ONOFF alongside a real colour
+        # mode, which a mixed group can otherwise produce.
+        if supported_modes - {ColorMode.BRIGHTNESS, ColorMode.ONOFF}:
+            supported_modes -= {ColorMode.BRIGHTNESS, ColorMode.ONOFF}
+        elif ColorMode.BRIGHTNESS in supported_modes:
+            supported_modes.discard(ColorMode.ONOFF)
 
         if len(supported_modes) == 0:
-            # Removing COLOR_TEMP can empty the set entirely, which happens
-            # whenever every unit in the group is colour temperature only.
-            # Falling back to UNKNOWN here made Home Assistant reject the
-            # entity, so the group silently never appeared. Fall back to what
-            # the units can still actually do instead.
+            # Fall back to what the units can still do. UNKNOWN is not valid in
+            # supported_color_modes and made Home Assistant drop the entity, so
+            # the group silently never appeared at all.
             group_modes = {
                 uc.type for u in group.units for uc in u.unitType.controls
             }
@@ -357,6 +375,11 @@ class CasambiLightGroup(CasambiLight, CasambiNetworkGroup):
                 rgb, w = kwargs[ATTR_RGBW_COLOR][:3], kwargs[ATTR_RGBW_COLOR][3]
                 await self._api.casa.setColor(self._obj, rgb)
                 await self._api.casa.setWhite(self._obj, w)
+                was_set = True
+            if ATTR_COLOR_TEMP_KELVIN in kwargs:
+                await self._api.casa.setTemperature(
+                    self._obj, kwargs[ATTR_COLOR_TEMP_KELVIN]
+                )
                 was_set = True
 
             if not was_set:
