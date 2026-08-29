@@ -264,7 +264,18 @@ class CasambiLightGroup(CasambiLight, CasambiNetworkGroup):
             supported_modes.remove(ColorMode.COLOR_TEMP)
 
         if len(supported_modes) == 0:
-            supported_modes.add(ColorMode.UNKNOWN)
+            # Removing COLOR_TEMP can empty the set entirely, which happens
+            # whenever every unit in the group is colour temperature only.
+            # Falling back to UNKNOWN here made Home Assistant reject the
+            # entity, so the group silently never appeared. Fall back to what
+            # the units can still actually do instead.
+            group_modes = {
+                uc.type for u in group.units for uc in u.unitType.controls
+            }
+            if UnitControlType.DIMMER in group_modes:
+                supported_modes.add(ColorMode.BRIGHTNESS)
+            else:
+                supported_modes.add(ColorMode.ONOFF)
         self._attr_supported_color_modes = supported_modes
 
         desc = TypedEntityDescription(
