@@ -20,6 +20,7 @@ from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
     ConfigEntryError,
     ConfigEntryNotReady,
+    HomeAssistantError,
 )
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.httpx_client import get_async_client
@@ -39,6 +40,18 @@ _LOGGER: Final = logging.getLogger(__name__)
 # means a tick during an in-flight attempt is a no-op, so a short interval
 # cannot pile up connection attempts.
 RECONNECT_WATCHDOG_INTERVAL: Final = timedelta(seconds=5)
+
+# How many consecutive watchdog checks may report the device as invisible
+# before we force a teardown of any stale BLE link.
+#
+# A powered-on Casambi node stops advertising while it believes it still has a
+# client. If the Casambi session dies but the underlying BLE link is left
+# half-open, the node goes quiet, Home Assistant stops seeing advertisements,
+# and the watchdog can never find a device to reconnect to: a deadlock that
+# previously only an integration reload or a Home Assistant restart could
+# break. Forcing a disconnect drops the stale link so the node advertises
+# again and the next watchdog tick can reconnect.
+WATCHDOG_FORCE_TEARDOWN_AFTER: Final = 3
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -93,6 +106,7 @@ class CasambiApi:
         self._callback_map: dict[int, list[Callable[[Unit], None]]] = {}
         self._cancel_bluetooth_callback: Callable[[], None] | None = None
         self._cancel_watchdog: Callable[[], None] | None = None
+        self._watchdog_misses = 0
         self._reconnect_lock = asyncio.Lock()
         self._first_disconnect = True
 
@@ -196,21 +210,49 @@ class CasambiApi:
         )
 
     async def _watchdog_reconnect(self) -> None:
-        """Reconnect from the watchdog if HA can currently see the device."""
+        """Reconnect from the watchdog, clearing a stale link if necessary."""
         device = bluetooth.async_ble_device_from_address(
             self.hass, self.address, connectable=True
         )
         if device is None:
+            self._watchdog_misses += 1
+            if self._watchdog_misses < WATCHDOG_FORCE_TEARDOWN_AFTER:
+                _LOGGER.debug(
+                    "Watchdog: device is not currently visible (%i/%i); "
+                    "will retry later.",
+                    self._watchdog_misses,
+                    WATCHDOG_FORCE_TEARDOWN_AFTER,
+                )
+                return
+            # The device staying invisible while we believe we are disconnected
+            # is the signature of a stale, half-open link. Drop it so the node
+            # starts advertising again.
             _LOGGER.debug(
-                "Watchdog: device is not currently visible; will retry later."
+                "Watchdog: device invisible for %i checks; forcing teardown of "
+                "any stale BLE link.",
+                self._watchdog_misses,
             )
+            self._watchdog_misses = 0
+            await self._force_teardown()
             return
+
+        self._watchdog_misses = 0
         try:
             await self.try_reconnect()
         except Exception:  # pylint: disable=broad-except
             _LOGGER.debug(
                 "Watchdog reconnect attempt failed; will retry later.", exc_info=True
             )
+
+    async def _force_teardown(self) -> None:
+        """Drop any stale BLE link so the controller starts advertising again."""
+        if self._reconnect_lock.locked():
+            return
+        async with self._reconnect_lock:
+            try:
+                await self.casa.disconnect()
+            except Exception:  # pylint: disable=broad-except
+                _LOGGER.debug("Forced teardown failed.", exc_info=True)
 
     async def disconnect(self) -> None:
         """Disconnects from the controller and disables automatic reconnect."""
@@ -277,6 +319,34 @@ class CasambiApi:
             await self.connect()
         finally:
             self._reconnect_lock.release()
+
+    async def ensure_connected(self) -> None:
+        """Make sure a live connection exists before sending a command.
+
+        Entities are never marked unavailable, so a command can arrive while
+        the Casambi session is down. Reconnect on demand instead of failing.
+        This also bypasses the watchdog's visibility check, which is exactly
+        what is needed to break out of a stale-link deadlock: try_reconnect
+        disconnects first, dropping the half-open link.
+        """
+        if self.casa.connected:
+            return
+
+        if self._reconnect_lock.locked():
+            # A reconnect is already in flight; wait for it rather than
+            # starting a competing one.
+            _LOGGER.debug("Command issued during an in-flight reconnect; waiting.")
+            async with self._reconnect_lock:
+                pass
+        else:
+            _LOGGER.debug("Command issued while disconnected; connecting on demand.")
+            await self.try_reconnect()
+
+        if not self.casa.connected:
+            raise HomeAssistantError(
+                f"Casambi network {self.address} is not connected and an "
+                "on-demand reconnect did not succeed"
+            )
 
     def register_unit_updates(self, unit: Unit, c: Callable[[Unit], None]) -> None:
         """Register a callback for unit updates.

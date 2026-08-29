@@ -122,6 +122,7 @@ class CasambiLight(CasambiEntity, LightEntity, metaclass=ABCMeta):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the entity of."""
+        await self._api.ensure_connected()
         await self._api.casa.setLevel(self._obj, 0)
 
 
@@ -193,6 +194,7 @@ class CasambiLightUnit(CasambiLight, CasambiUnitEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on the unit."""
+        await self._api.ensure_connected()
         unit = cast("Unit", self._obj)
         state = copy(unit.state)
         if not state:
@@ -229,6 +231,7 @@ class CasambiLightUnit(CasambiLight, CasambiUnitEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off the unit."""
+        await self._api.ensure_connected()
         # HACK: Try to get lights only supporting ONOFF to turn off.
         # SetLevel doesn't seem to work for unknown reasons.
         if self.color_mode == ColorMode.ONOFF:
@@ -329,6 +332,7 @@ class CasambiLightGroup(CasambiLight, CasambiNetworkGroup):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn on all units in the group."""
+        await self._api.ensure_connected()
         was_set = False
         if ATTR_BRIGHTNESS in kwargs:
             await self._api.casa.setLevel(self._obj, kwargs[ATTR_BRIGHTNESS])

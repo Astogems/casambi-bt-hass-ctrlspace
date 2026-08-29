@@ -43,8 +43,16 @@ class CasambiEntity(Entity, metaclass=ABCMeta):
 
     @property
     def available(self) -> bool:
-        """Return True if entity is available."""
-        return self._api.available
+        """Return True always.
+
+        Casambi entities are deliberately never marked unavailable. A dropped
+        BLE session is usually transient, and flipping every light to
+        unavailable in the meantime breaks dashboards and makes automations
+        fail. Commands sent while the session is down reconnect on demand (see
+        CasambiApi.ensure_connected), and the true connection state is reported
+        by the network "Status" connectivity sensor.
+        """
+        return True
 
     @callback
     def _change_callback(self, _unit: CasambiUnit) -> None:
@@ -105,10 +113,8 @@ class CasambiNetworkGroup(CasambiNetworkEntity, metaclass=ABCMeta):
 
     @property
     def available(self) -> bool:
-        """Return true if any of the units in the group is available."""
-        return super().available and any(
-            unit.online for unit in self._unit_map.values()
-        )
+        """Return True always. See CasambiEntity.available."""
+        return True
 
     @callback
     def _change_callback(self, unit: CasambiUnit) -> None:
@@ -171,9 +177,8 @@ class CasambiUnitEntity(CasambiEntity, metaclass=ABCMeta):
 
     @property
     def available(self) -> bool:
-        """Return True if the unit is available."""
-        unit = cast("CasambiUnit", self._obj)
-        return super().available and unit.online
+        """Return True always. See CasambiEntity.available."""
+        return True
 
     @callback
     def _change_callback(self, unit: CasambiUnit) -> None:
