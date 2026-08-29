@@ -32,7 +32,13 @@ _LOGGER: Final = logging.getLogger(__name__)
 # if not, attempts to reconnect. This is the safety net that recovers the
 # integration after an ungraceful drop (e.g. cutting mains power at the wall
 # switch) without requiring a Home Assistant restart.
-RECONNECT_WATCHDOG_INTERVAL: Final = timedelta(seconds=60)
+#
+# The interval is deliberately short so recovery is bounded by roughly this
+# many seconds plus the reconnect itself. Ticks are cheap: while connected the
+# check is a single property read, and while disconnected the reconnect lock
+# means a tick during an in-flight attempt is a no-op, so a short interval
+# cannot pile up connection attempts.
+RECONNECT_WATCHDOG_INTERVAL: Final = timedelta(seconds=5)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -302,6 +308,9 @@ class CasambiApi:
         _change: bluetooth.BluetoothChange,
     ) -> None:
         if not self.casa.connected and service_info.connectable:
+            _LOGGER.debug(
+                "Advertisement received while disconnected; reconnecting now."
+            )
             self.conf_entry.async_create_background_task(
                 self.hass, self.try_reconnect(), "Reconnect"
             )
