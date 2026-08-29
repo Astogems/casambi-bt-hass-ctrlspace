@@ -69,6 +69,13 @@ DISCONNECT_TIMEOUT: Final = 10.0
 # giving up and proceeding without the lock.
 LOCK_WAIT_TIMEOUT: Final = 5.0
 
+# Back off between failed reconnects instead of retrying every tick.
+# A node that has just been power cycled appears to need a stretch of quiet
+# before it will start the key exchange, and reconnecting every few seconds
+# may be what keeps it from ever settling. Delays double from the watchdog
+# interval up to the cap. A command from the user ignores the backoff.
+RECONNECT_BACKOFF_MAX: Final = 300.0
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Casambi Bluetooth from a config entry."""
@@ -124,6 +131,8 @@ class CasambiApi:
         self._cancel_watchdog: Callable[[], None] | None = None
         self._watchdog_misses = 0
         self._link_suspect = False
+        self._failed_attempts = 0
+        self._next_attempt: float = 0.0
         self._reconnect_lock = asyncio.Lock()
         self._first_disconnect = True
 
@@ -155,6 +164,8 @@ class CasambiApi:
                 raise
             self._first_disconnect = True
             self._link_suspect = False
+            self._failed_attempts = 0
+            self._next_attempt = 0.0
         except BluetoothError as err:
             raise ConfigEntryNotReady("Failed to use bluetooth") from err
         except NetworkNotFoundError as err:
@@ -237,6 +248,8 @@ class CasambiApi:
         """Ensure the controller is connected, reconnecting if it is not."""
         if self.casa.connected or self._reconnect_lock.locked():
             return
+        if self.hass.loop.time() < self._next_attempt:
+            return
         _LOGGER.debug(
             "Watchdog detected a disconnected controller; attempting reconnect."
         )
@@ -275,9 +288,24 @@ class CasambiApi:
         try:
             await self.try_reconnect()
         except Exception:  # pylint: disable=broad-except
+            self._note_failed_attempt()
             _LOGGER.debug(
                 "Watchdog reconnect attempt failed; will retry later.", exc_info=True
             )
+
+    def _note_failed_attempt(self) -> None:
+        """Record a failed reconnect and push the next attempt further out."""
+        self._failed_attempts += 1
+        delay = min(
+            RECONNECT_WATCHDOG_INTERVAL.total_seconds() * 2 ** (self._failed_attempts - 1),
+            RECONNECT_BACKOFF_MAX,
+        )
+        self._next_attempt = self.hass.loop.time() + delay
+        _LOGGER.debug(
+            "Reconnect attempt %i failed; next automatic attempt in %.0fs.",
+            self._failed_attempts,
+            delay,
+        )
 
     async def _release_failed_connection(self) -> None:
         """Release the BLE client left behind by a failed connect.
