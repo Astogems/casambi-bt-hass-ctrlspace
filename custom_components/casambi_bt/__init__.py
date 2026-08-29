@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Final
 
 from CasambiBt import Casambi, Group, Scene, Unit, UnitControlType
-from CasambiBt.errors import AuthenticationError, BluetoothError, NetworkNotFoundError
+from CasambiBt.errors import (
+    AuthenticationError,
+    BluetoothError,
+    NetworkNotFoundError,
+    ProtocolError,
+)
 
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry
@@ -159,6 +164,13 @@ class CasambiApi:
         except AuthenticationError as err:
             raise ConfigEntryAuthFailed(
                 f"Failed to authenticate to network {self.address}"
+            ) from err
+        except ProtocolError as err:
+            # The handshake stalled or the device dropped mid-exchange. This is
+            # transient, so ask HA to retry rather than failing the entry.
+            self._link_suspect = True
+            raise ConfigEntryNotReady(
+                f"Handshake with network {self.address} did not complete: {err}"
             ) from err
         except TimeoutError as err:
             self._link_suspect = True
