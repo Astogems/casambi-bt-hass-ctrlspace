@@ -14,6 +14,6 @@
   "documentation": "https://github.com/lkempf/casambi-bt-hass",
   "integration_type": "hub",
   "iot_class": "local_push",
-  "requirements": ["casambi-bt @ git+https://github.com/Astogems/casambi-bt@ccb329f"],
-  "version": "0.2.2+watchdog.7"
+  "requirements": ["casambi-bt-reconnect @ git+https://github.com/Astogems/casambi-bt@242d8d4"],
+  "version": "0.2.2+watchdog.8"
 }
