@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterable
+from datetime import datetime, timedelta
 import logging
 from pathlib import Path
 from typing import Final
@@ -20,17 +21,25 @@ from homeassistant.exceptions import (
     ConfigEntryError,
     ConfigEntryNotReady,
 )
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.httpx_client import get_async_client
 
 from .const import DOMAIN, PLATFORMS
 
 _LOGGER: Final = logging.getLogger(__name__)
 
+# How often the watchdog checks that the controller is still connected and,
+# if not, attempts to reconnect. This is the safety net that recovers the
+# integration after an ungraceful drop (e.g. cutting mains power at the wall
+# switch) without requiring a Home Assistant restart.
+RECONNECT_WATCHDOG_INTERVAL: Final = timedelta(seconds=60)
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Casambi Bluetooth from a config entry."""
     api = CasambiApi(hass, entry, entry.data[CONF_ADDRESS], entry.data[CONF_PASSWORD])
     await api.connect()
+    api.start_watchdog()
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = api
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -77,6 +86,7 @@ class CasambiApi:
 
         self._callback_map: dict[int, list[Callable[[Unit], None]]] = {}
         self._cancel_bluetooth_callback: Callable[[], None] | None = None
+        self._cancel_watchdog: Callable[[], None] | None = None
         self._reconnect_lock = asyncio.Lock()
         self._first_disconnect = True
 
@@ -150,9 +160,59 @@ class CasambiApi:
 
         return self.casa.scenes
 
+    def start_watchdog(self) -> None:
+        """Start the periodic reconnect watchdog.
+
+        The watchdog is a safety net on top of the disconnect callback and the
+        Bluetooth advertisement callback. Those two paths can fail to recover
+        the connection after an ungraceful drop (for example when the fixture
+        is switched off at the mains and then back on): the light can end up
+        connected at the BLE level but with the Casambi handshake incomplete,
+        so it no longer advertises and no advertisement callback ever fires.
+        The watchdog periodically checks the real connection state and keeps
+        retrying until the controller is back, so no HA restart is needed.
+        """
+        if self._cancel_watchdog is None:
+            self._cancel_watchdog = async_track_time_interval(
+                self.hass, self._watchdog, RECONNECT_WATCHDOG_INTERVAL
+            )
+
+    @callback
+    def _watchdog(self, now: datetime | None = None) -> None:
+        """Ensure the controller is connected, reconnecting if it is not."""
+        if self.casa.connected or self._reconnect_lock.locked():
+            return
+        _LOGGER.debug(
+            "Watchdog detected a disconnected controller; attempting reconnect."
+        )
+        self.conf_entry.async_create_background_task(
+            self.hass, self._watchdog_reconnect(), "Casambi watchdog reconnect"
+        )
+
+    async def _watchdog_reconnect(self) -> None:
+        """Reconnect from the watchdog if HA can currently see the device."""
+        device = bluetooth.async_ble_device_from_address(
+            self.hass, self.address, connectable=True
+        )
+        if device is None:
+            _LOGGER.debug(
+                "Watchdog: device is not currently visible; will retry later."
+            )
+            return
+        try:
+            await self.try_reconnect()
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug(
+                "Watchdog reconnect attempt failed; will retry later.", exc_info=True
+            )
+
     async def disconnect(self) -> None:
         """Disconnects from the controller and disables automatic reconnect."""
         async with self._reconnect_lock:
+            if self._cancel_watchdog is not None:
+                self._cancel_watchdog()
+                self._cancel_watchdog = None
+
             if self._cancel_bluetooth_callback is not None:
                 self._cancel_bluetooth_callback()
                 self._cancel_bluetooth_callback = None
