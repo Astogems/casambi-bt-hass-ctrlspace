@@ -53,6 +53,17 @@ RECONNECT_WATCHDOG_INTERVAL: Final = timedelta(seconds=5)
 # again and the next watchdog tick can reconnect.
 WATCHDOG_FORCE_TEARDOWN_AFTER: Final = 3
 
+# No BLE operation may block forever. Without these, a single hung connect or
+# disconnect holds _reconnect_lock indefinitely, and because every recovery
+# path either takes that lock or gives up when it is held, the integration
+# wedges permanently: the watchdog skips every tick, commands block, and even
+# unloading the config entry hangs, so only a Home Assistant restart recovers.
+CONNECT_TIMEOUT: Final = 30.0
+DISCONNECT_TIMEOUT: Final = 10.0
+# How long anything else will wait for an in-flight reconnect to finish before
+# giving up and proceeding without the lock.
+LOCK_WAIT_TIMEOUT: Final = 5.0
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Casambi Bluetooth from a config entry."""
@@ -131,7 +142,8 @@ class CasambiApi:
             self.casa.registerDisconnectCallback(self._casa_disconnect)
             self.casa.registerUnitChangedHandler(self._unit_changed_handler)
 
-            await self.casa.connect(device, self.password)
+            async with asyncio.timeout(CONNECT_TIMEOUT):
+                await self.casa.connect(device, self.password)
             self._first_disconnect = True
             self._link_suspect = False
         except BluetoothError as err:
@@ -143,6 +155,11 @@ class CasambiApi:
         except AuthenticationError as err:
             raise ConfigEntryAuthFailed(
                 f"Failed to authenticate to network {self.address}"
+            ) from err
+        except TimeoutError as err:
+            self._link_suspect = True
+            raise ConfigEntryNotReady(
+                f"Timed out connecting to network {self.address}"
             ) from err
         except Exception as err:  # pylint: disable=broad-except
             raise ConfigEntryError(
@@ -252,13 +269,32 @@ class CasambiApi:
             return
         async with self._reconnect_lock:
             try:
-                await self.casa.disconnect()
+                async with asyncio.timeout(DISCONNECT_TIMEOUT):
+                    await self.casa.disconnect()
             except Exception:  # pylint: disable=broad-except
                 _LOGGER.debug("Forced teardown failed.", exc_info=True)
 
     async def disconnect(self) -> None:
-        """Disconnects from the controller and disables automatic reconnect."""
-        async with self._reconnect_lock:
+        """Disconnect from the controller and disable automatic reconnect.
+
+        This runs while the config entry is unloading, so it must always
+        finish. Waiting unconditionally for _reconnect_lock here is what makes
+        a reload hang forever behind a stuck reconnect, leaving a restart as
+        the only way out, so the lock is best-effort.
+        """
+        got_lock = False
+        try:
+            async with asyncio.timeout(LOCK_WAIT_TIMEOUT):
+                await self._reconnect_lock.acquire()
+            got_lock = True
+        except TimeoutError:
+            _LOGGER.warning(
+                "A reconnect was still in flight after %ss; tearing down "
+                "anyway so the config entry can unload.",
+                LOCK_WAIT_TIMEOUT,
+            )
+
+        try:
             if self._cancel_watchdog is not None:
                 self._cancel_watchdog()
                 self._cancel_watchdog = None
@@ -272,10 +308,16 @@ class CasambiApi:
             self.casa.unregisterDisconnectCallback(self._casa_disconnect)
 
             try:
-                await self.casa.disconnect()
+                async with asyncio.timeout(DISCONNECT_TIMEOUT):
+                    await self.casa.disconnect()
+            except TimeoutError:
+                _LOGGER.warning("Timed out disconnecting from the controller.")
             except Exception:
                 _LOGGER.exception("Error during disconnect.")
             self.casa.unregisterUnitChangedHandler(self._unit_changed_handler)
+        finally:
+            if got_lock:
+                self._reconnect_lock.release()
 
     @callback
     def _casa_disconnect(self) -> None:
@@ -314,11 +356,14 @@ class CasambiApi:
 
         try:
             try:
-                await self.casa.disconnect()
+                async with asyncio.timeout(DISCONNECT_TIMEOUT):
+                    await self.casa.disconnect()
             # HACK: This is a workaround for https://github.com/lkempf/casambi-bt-hass/issues/26
             # We don't actually need to disconnect except to clean up so this should be ok to ignore.
             except AttributeError:
                 _LOGGER.debug("Unexpected failure during disconnect.")
+            except TimeoutError:
+                _LOGGER.debug("Disconnect timed out; continuing with connect.")
             await self.connect()
         finally:
             self._reconnect_lock.release()
@@ -342,10 +387,14 @@ class CasambiApi:
 
         if self._reconnect_lock.locked():
             # A reconnect is already in flight; wait for it rather than
-            # starting a competing one.
+            # starting a competing one, but never block the command forever.
             _LOGGER.debug("Command issued during an in-flight reconnect; waiting.")
-            async with self._reconnect_lock:
-                pass
+            try:
+                async with asyncio.timeout(LOCK_WAIT_TIMEOUT):
+                    async with self._reconnect_lock:
+                        pass
+            except TimeoutError:
+                _LOGGER.debug("In-flight reconnect did not finish in time.")
         else:
             _LOGGER.debug(
                 "Rebuilding connection before command (forced=%s, suspect=%s, "
