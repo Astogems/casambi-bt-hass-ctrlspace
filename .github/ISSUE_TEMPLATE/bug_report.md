@@ -28,4 +28,4 @@ If applicable, add screenshots to help explain your problem.
 - Integration version:
 
 **Logs**
-See https://github.com/lkempf/casambi-bt-hass#reporting-issues on how to enable logs. Please make sure to at least include the log of the first connection with the network (be restarting HA or reloading the integration) and the log at the time an error happens (if applicable).
+See https://github.com/Astogems/casambi-bt-hass-ctrlspace#reporting-issues on how to enable logs. Please make sure to at least include the log of the first connection with the network (be restarting HA or reloading the integration) and the log at the time an error happens (if applicable).
