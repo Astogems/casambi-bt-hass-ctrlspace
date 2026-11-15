@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
+import contextlib
 from datetime import datetime, timedelta
 import logging
 from pathlib import Path
@@ -136,6 +137,14 @@ class CasambiApi:
         self._reconnect_lock = asyncio.Lock()
         self._first_disconnect = True
 
+        # self.casa outlives every reconnect (only its BLE client is rebuilt)
+        # and the library appends handlers without de-duplicating them, so
+        # handlers are registered exactly once here. Registering them in
+        # connect() added another copy on every reconnect, fanning each state
+        # change and disconnect out N times.
+        self.casa.registerDisconnectCallback(self._casa_disconnect)
+        self.casa.registerUnitChangedHandler(self._unit_changed_handler)
+
     def _register_bluetooth_callback(self) -> None:
         self._cancel_bluetooth_callback = bluetooth.async_register_callback(
             self.hass,
@@ -152,9 +161,6 @@ class CasambiApi:
             )
             if not device:
                 raise NetworkNotFoundError  # noqa: TRY301
-
-            self.casa.registerDisconnectCallback(self._casa_disconnect)
-            self.casa.registerUnitChangedHandler(self._unit_changed_handler)
 
             try:
                 async with asyncio.timeout(CONNECT_TIMEOUT):
@@ -375,7 +381,10 @@ class CasambiApi:
 
             # This needs to happen before we disconnect.
             # We don't want to be informed about disconnects initiated by us.
-            self.casa.unregisterDisconnectCallback(self._casa_disconnect)
+            # The handlers were registered once in __init__; suppress
+            # ValueError so a repeated disconnect() stays harmless.
+            with contextlib.suppress(ValueError):
+                self.casa.unregisterDisconnectCallback(self._casa_disconnect)
 
             try:
                 async with asyncio.timeout(DISCONNECT_TIMEOUT):
@@ -384,7 +393,8 @@ class CasambiApi:
                 _LOGGER.warning("Timed out disconnecting from the controller.")
             except Exception:
                 _LOGGER.exception("Error during disconnect.")
-            self.casa.unregisterUnitChangedHandler(self._unit_changed_handler)
+            with contextlib.suppress(ValueError):
+                self.casa.unregisterUnitChangedHandler(self._unit_changed_handler)
         finally:
             if got_lock:
                 self._reconnect_lock.release()
