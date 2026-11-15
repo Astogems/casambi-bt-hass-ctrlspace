@@ -83,7 +83,7 @@ Some (optional) explanation of what this does: `pip` is used for managing depend
 For the integration you also probably want homeassistant to always pick up your latest changes. Thankfully, this is easier as with dependencies. You can simply link the folder containing the integration into your development installation of homeassistant with the following commands:
 
 ```bash
-git clone https://github.com/lkempf/casambi-bt-hass.git
+git clone https://github.com/Astogems/casambi-bt-hass-ctrlspace.git casambi-bt-hass
 cd core/config/
 mkdir custom_components
 cd custom_components

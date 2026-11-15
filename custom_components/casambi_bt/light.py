@@ -223,9 +223,7 @@ class CasambiLightUnit(CasambiLight, CasambiUnitEntity):
             set_state = True
 
         if set_state:
-            await self._api.execute(
-                lambda: self._api.casa.setUnitState(unit, state)
-            )
+            await self._api.execute(lambda: self._api.casa.setUnitState(unit, state))
         else:
             await self._api.execute(lambda: self._api.casa.turnOn(self._obj))
 
@@ -287,9 +285,7 @@ class CasambiLightGroup(CasambiLight, CasambiNetworkGroup):
             # Fall back to what the units can still do. UNKNOWN is not valid in
             # supported_color_modes and made Home Assistant drop the entity, so
             # the group silently never appeared at all.
-            group_modes = {
-                uc.type for u in group.units for uc in u.unitType.controls
-            }
+            group_modes = {uc.type for u in group.units for uc in u.unitType.controls}
             if UnitControlType.DIMMER in group_modes:
                 supported_modes.add(ColorMode.BRIGHTNESS)
             else:

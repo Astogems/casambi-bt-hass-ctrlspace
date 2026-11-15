@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
+import contextlib
 from datetime import datetime, timedelta
 import logging
 from pathlib import Path
 from typing import Final
 
 from CasambiBt import Casambi, Group, Scene, Unit, UnitControlType
+from CasambiBt._switch import ButtonEventType, SwitchEvent
 from CasambiBt.errors import (
     AuthenticationError,
     BluetoothError,
@@ -30,7 +32,7 @@ from homeassistant.exceptions import (
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.httpx_client import get_async_client
 
-from .const import DOMAIN, PLATFORMS
+from .const import DOMAIN, PLATFORMS, SWITCH_EVENT
 
 _LOGGER: Final = logging.getLogger(__name__)
 
@@ -76,6 +78,10 @@ LOCK_WAIT_TIMEOUT: Final = 5.0
 # interval up to the cap. A command from the user ignores the backoff.
 RECONNECT_BACKOFF_MAX: Final = 300.0
 
+# BLE can deliver the same switch event more than once. An identical
+# (unit, button, event) within this many seconds is treated as a duplicate.
+SWITCH_DEDUPE_WINDOW: Final = 0.15
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Casambi Bluetooth from a config entry."""
@@ -83,6 +89,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await api.connect()
     api.start_watchdog()
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = api
+
+    if _LOGGER.isEnabledFor(logging.DEBUG):
+        # One line per unit, so unknown fixtures (switches, motors) can be
+        # identified from a debug log.
+        for unit in api.get_units():
+            ut = unit.unitType
+            _LOGGER.debug(
+                "Unit deviceId=%i name=%r fixture=%i model=%r manufacturer=%r "
+                "mode=%r stateLength=%i controls=%s",
+                unit.deviceId,
+                unit.name,
+                ut.id,
+                ut.model,
+                ut.manufacturer,
+                ut.mode,
+                ut.stateLength,
+                [(c.type.name, c.offset, c.length) for c in ut.controls],
+            )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -136,6 +160,19 @@ class CasambiApi:
         self._reconnect_lock = asyncio.Lock()
         self._first_disconnect = True
 
+        # self.casa outlives every reconnect (only its BLE client is rebuilt)
+        # and the library appends handlers without de-duplicating them, so
+        # handlers are registered exactly once here. Registering them in
+        # connect() added another copy on every reconnect, fanning each state
+        # change and disconnect out N times.
+        self.casa.registerDisconnectCallback(self._casa_disconnect)
+        self.casa.registerUnitChangedHandler(self._unit_changed_handler)
+        self.casa.registerSwitchEventHandler(self._switch_event_handler)
+
+        self._switch_listeners: list[Callable[[SwitchEvent], None]] = []
+        # (unit_id, button, event) -> loop time it was last seen, for dedupe.
+        self._switch_last_seen: dict[tuple[int, int, ButtonEventType], float] = {}
+
     def _register_bluetooth_callback(self) -> None:
         self._cancel_bluetooth_callback = bluetooth.async_register_callback(
             self.hass,
@@ -152,9 +189,6 @@ class CasambiApi:
             )
             if not device:
                 raise NetworkNotFoundError  # noqa: TRY301
-
-            self.casa.registerDisconnectCallback(self._casa_disconnect)
-            self.casa.registerUnitChangedHandler(self._unit_changed_handler)
 
             try:
                 async with asyncio.timeout(CONNECT_TIMEOUT):
@@ -297,7 +331,8 @@ class CasambiApi:
         """Record a failed reconnect and push the next attempt further out."""
         self._failed_attempts += 1
         delay = min(
-            RECONNECT_WATCHDOG_INTERVAL.total_seconds() * 2 ** (self._failed_attempts - 1),
+            RECONNECT_WATCHDOG_INTERVAL.total_seconds()
+            * 2 ** (self._failed_attempts - 1),
             RECONNECT_BACKOFF_MAX,
         )
         self._next_attempt = self.hass.loop.time() + delay
@@ -374,7 +409,10 @@ class CasambiApi:
 
             # This needs to happen before we disconnect.
             # We don't want to be informed about disconnects initiated by us.
-            self.casa.unregisterDisconnectCallback(self._casa_disconnect)
+            # The handlers were registered once in __init__; suppress
+            # ValueError so a repeated disconnect() stays harmless.
+            with contextlib.suppress(ValueError):
+                self.casa.unregisterDisconnectCallback(self._casa_disconnect)
 
             try:
                 async with asyncio.timeout(DISCONNECT_TIMEOUT):
@@ -383,7 +421,10 @@ class CasambiApi:
                 _LOGGER.warning("Timed out disconnecting from the controller.")
             except Exception:
                 _LOGGER.exception("Error during disconnect.")
-            self.casa.unregisterUnitChangedHandler(self._unit_changed_handler)
+            with contextlib.suppress(ValueError):
+                self.casa.unregisterUnitChangedHandler(self._unit_changed_handler)
+            with contextlib.suppress(ValueError):
+                self.casa.unregisterSwitchEventHandler(self._switch_event_handler)
         finally:
             if got_lock:
                 self._reconnect_lock.release()
@@ -522,6 +563,58 @@ class CasambiApi:
             return
         for c in self._callback_map[unit.deviceId]:
             c(unit)
+
+    def get_unit_by_device_id(self, device_id: int) -> Unit | None:
+        """Return the unit with the given Casambi device ID, if any."""
+        return next((u for u in self.casa.units if u.deviceId == device_id), None)
+
+    def register_switch_listener(
+        self, listener: Callable[[SwitchEvent], None]
+    ) -> Callable[[], None]:
+        """Subscribe to de-duplicated switch events.
+
+        :param listener: Called on the event loop for every switch event.
+        :return: A function that removes the listener again.
+        """
+        self._switch_listeners.append(listener)
+
+        def unsubscribe() -> None:
+            with contextlib.suppress(ValueError):
+                self._switch_listeners.remove(listener)
+
+        return unsubscribe
+
+    @callback
+    def _switch_event_handler(self, ev: SwitchEvent) -> None:
+        """Fire a bus event and notify listeners for a wall-switch event."""
+        now = self.hass.loop.time()
+        key = (ev.unit_id, ev.button, ev.event)
+        last = self._switch_last_seen.get(key)
+        self._switch_last_seen[key] = now
+        if last is not None and now - last < SWITCH_DEDUPE_WINDOW:
+            _LOGGER.debug("Dropping duplicate switch event %s", ev)
+            return
+
+        unit = self.get_unit_by_device_id(ev.unit_id)
+        self.hass.bus.async_fire(
+            SWITCH_EVENT,
+            {
+                "entry_id": self.conf_entry.entry_id,
+                "unit_id": ev.unit_id,
+                "unit_uuid": unit.uuid if unit else None,
+                "unit_name": unit.name if unit else None,
+                "button": ev.button,
+                "event": ev.event.name.lower(),
+                "action": ev.action,
+                "message_type": ev.message_type,
+                "flags": ev.flags,
+            },
+        )
+        for listener in list(self._switch_listeners):
+            try:
+                listener(ev)
+            except Exception:  # pylint: disable=broad-except
+                _LOGGER.exception("Error in switch event listener.")
 
     @callback
     def _bluetooth_callback(
