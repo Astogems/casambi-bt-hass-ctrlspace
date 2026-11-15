@@ -297,7 +297,8 @@ class CasambiApi:
         """Record a failed reconnect and push the next attempt further out."""
         self._failed_attempts += 1
         delay = min(
-            RECONNECT_WATCHDOG_INTERVAL.total_seconds() * 2 ** (self._failed_attempts - 1),
+            RECONNECT_WATCHDOG_INTERVAL.total_seconds()
+            * 2 ** (self._failed_attempts - 1),
             RECONNECT_BACKOFF_MAX,
         )
         self._next_attempt = self.hass.loop.time() + delay
